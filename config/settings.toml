@@ -1,0 +1,19 @@
+[SkillPrior]
+# 模型配置
+cond_decode = true
+# lstm编码器配置
+q_lstm_hidden_dim = 64    # 编码器LSTM特征维度
+q_embed_dim =  10   # 技能空间的维度
+q_lstm_layers = 1 # lstm的层数
+# 先验网络参数
+prior_input_dim = 15    # 先验输入的维度
+prior_hidden_dim = 128  # 先验网络隐藏层维度
+prior_net_layers = 6    # 先验网络的层数
+# 解码网络参数
+nz_mid_lstm = 128
+n_rollout_steps = 9
+
+# 误差系数
+rec_mse_weight = 1
+optimize_beta = true # 是否更新beta
+target_kl = 1.7   # 目标kl_loss
