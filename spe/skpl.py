@@ -1,6 +1,7 @@
 from contextlib import contextmanager
 import torch
 import os
+import logging
 from torch.nn.modules import ReLU
 from spe.distribution import Gaussion, MutivariateGuassion
 from config.config import settings
@@ -128,6 +129,8 @@ class SkillPriorMdl(torch.nn.Module):
     """
     def __init__(self, env):
         super(SkillPriorMdl, self).__init__()
+        self.logger = logging.getLogger(__name__)
+        # var
         self.log_out = 100
         self.count = 0
         self.device = "cuda"
@@ -306,19 +309,21 @@ class SkillPriorMdl(torch.nn.Module):
         torch.save(self.prior.state_dict(), os.path.join(path, "prior.pkl"))
         if self.optimize_beta:
             torch.save(self._log_beta.state_dict(), os.path.join(path, "log_beta.pkl"))
+        self.logger.info(f"Save model to {path}")
 
     def load_model(self, path):
         assert os.path.exists(path=path), f"path: {path} not exist."
-        weights_list = os.walk(path)
+        weights_list = os.listdir(path)
         assert "inference.pkl" in weights_list, "weight: inference.pkl not exist."
         assert "decoder.pkl" in weights_list, "weight: decoder.pkl not exist."
         assert "prior.pkl" in weights_list, "weight: prior.pkl not exist."
         self.q.load_state_dict(torch.load(os.path.join(path, "inference.pkl")))
         self.decoder.load_state_dict(torch.load(os.path.join(path, "decoder.pkl")))
-        self.prior.load_state_dict(torch.load(os.join(path, "prior.pkl")))
+        self.prior.load_state_dict(torch.load(os.path.join(path, "prior.pkl")))
         if self.optimize_beta:
             assert "log_beta.pkl" in weights_list, "weight: log_beta.pkl not exist."
             self._log_beta.load_state_dict(torch.load(os.path.join(path, "log_beta.pkl")))
+        self.logger.info(f"Load weight from {path}")
 
     @contextmanager
     def val_mode(self):
