@@ -23,6 +23,10 @@ class Gaussion:
         """
         return self.mu + self.sigma * torch.randn_like(self.sigma)
     
+    def rsample(self):
+        """Identical to self.sample(), to conform with pytorch naming scheme."""
+        return self.sample()
+    
     
     def kl_divergence(self, other):
         """Computes the KL divergence with other distribution.
