@@ -30,7 +30,7 @@ class MultiLayerLinear(torch.nn.Module):
         self.net = torch.nn.Sequential()
         self.net.append(torch.nn.Linear(input_dim, hidden_dim))
         self.net.append(torch.nn.ReLU())
-        for _ in range(hidden_dim):
+        for _ in range(self.layers_num):
             self.net.append(torch.nn.Linear(hidden_dim, hidden_dim))
             self.net.append(torch.nn.ReLU())
         self.net.append(torch.nn.Linear(hidden_dim, output_dim))
@@ -77,19 +77,23 @@ class LSTMEncoder(torch.nn.Module):
         self.lstm = torch.nn.LSTM(input_size, hidden_size, num_layers, batch_first=True)
         self.fc = torch.nn.Linear(hidden_size, output_size)
 
-    def forward(self, x):
-        h0 = torch.zeros(self.num_layers, x.size(0), self.hidden_size).to(x.device)
-        c0 = torch.zeros(self.num_layers, x.size(0), self.hidden_size).to(x.device)
+    def forward(self, action, cond_input=None):
+        if cond_input is not None:
+            encode_input = torch.cat((cond_input, action), dim=-1)
+        else:
+            encode_input = action
+        h0 = torch.zeros(self.num_layers, encode_input.size(0), self.hidden_size).to(encode_input.device)
+        c0 = torch.zeros(self.num_layers, encode_input.size(0), self.hidden_size).to(encode_input.device)
         
         # forward lstm
-        out, (hn, cn) = self.lstm(x, (h0, c0))
+        out, (hn, cn) = self.lstm(encode_input, (h0, c0))
         last_out = hn[-1,:,:]
 
         # Decode the hidden state of the last time step
         encoded = self.fc(last_out)
         return encoded
     
-class LSTMDecoderWithInitalizer(LSTMEncoder):
+class LSTMDecoder(LSTMEncoder):
 
     def __init__(self,
                  input_size,
@@ -98,94 +102,166 @@ class LSTMDecoderWithInitalizer(LSTMEncoder):
                  num_layers,
                  ):
         super().__init__(input_size, hidden_size, output_size, num_layers)
-        # self.input_initalizer = input_initalizer
-        # self.hidden_initalizer = hidden_initalizer
 
     def forward(self, z, cond_input, seq_length):
-         # Initialize hidden state and cell state with z
-        # h0 = self.hidden_initalizer(cond_input)
-        # c0 = self.input_initalizer(cond_input)
-        decode_input = torch.cat((cond_input, z), -1)
+        if cond_input is not None:
+            decode_input = torch.cat((cond_input, z), -1)
+        else:
+            decode_input = z
         x = decode_input.unsqueeze(1).repeat(1, seq_length, 1)
         h0 = torch.zeros(self.num_layers, x.size(0), self.hidden_size).to(x.device)
         c0 = torch.zeros(self.num_layers, x.size(0), self.hidden_size).to(x.device)
         out, _ = self.lstm(x, (h0, c0))
         recon_x = self.fc(out)
-        # decoder_input = z 
-        # # Forward propagate LSTM
-        # # 
-        # for _ in range(seq_length):
-        #     output, (h0, c0) = self.lstm(decoder_input, (h0, c0))
-        #     # Decode the hidden state of the last time step
-        #     out = self.fc(output)
-        #     outputs.append(output)
-        #     decoder_input = output
-        # output_sequence = torch.cat(outputs, dim=1)
+       
         return recon_x
 
 
 class SkillPriorMdl(torch.nn.Module):
     """Skill embeding + prior model for HPRL algorithm.
     """
-    def __init__(self, env):
+    def __init__(self, params):
+        """Skill Prior Model parameters.
+
+        Args:
+            model_params (AttriDict): parameters dictionary:
+            (1) encoder_params:
+                - cond_encode (bool): if use condition encode. -> (true)
+                - cond_encode_dim (int) -> (15)
+                - lstm_hidden_dim_enc (int) -> (64)
+                - lstm_layers_enc (int) -> (1)
+            (2) decoder_params:
+                - cond_decode (bool): if use condition decode. -> (true)
+                - cond_decode_dim (int) -> (15)
+                - lstm_hidden_dim_dec (int) -> (64)
+                - lstm_layers_dec (int) -> (1)
+                - rec_mse_weight: reconstruction mse loss weight. -> (1)
+                - n_rollout_stpes: rollout steps.
+            (3) prior_params:
+                - prior_input_size (int) -> (15)
+                - hidden_dim_pr (int) -> (128)
+                - num_layers (int) -> (6)
+            (4) beta_params:
+                - kl_div_weight: the const alpha. -> (0.005)
+                - target_kl: the target kl diverigence used to updata alpha. -> (0.18)
+                - optimize_beta: if update the temperature coefficient. -> (true)
+                - lr: learning rate if use optimize beta. -> (3e-4)
+            (5) model_params:
+                - device: 'cuda' or 'cpu'. -> ('cuda')
+                - action_dim: action dim of the environment. -> (2)
+                - state_dim: state dim of the environmet. -> (15)
+                - z_size: the skill space dim -> (10)
+        """
         super(SkillPriorMdl, self).__init__()
         self.logger = logging.getLogger(__name__)
-        # var
-        self.log_out = 100
-        self.count = 0
-        self.device = "cuda"
-        # TODO：beta
-        self.beta = 0.0005
+        self.params = params
+        
+        self._default_params(params)
         self._sample_prior = False
-        self.env = env
-        self.action_dim = env.action_dim
-        self.state_dim = env.state_dim
-        self.rec_mse_weight = settings.SkillPrior.rec_mse_weight
-        self.n_rollout_steps = settings.SkillPrior.n_rollout_steps
-        # build inference network
-        infer_input_size = self.action_dim
-        if settings.SkillPrior.cond_decode:
-            infer_input_size += settings.SkillPrior.prior_input_dim
-        self.q = LSTMEncoder(input_size=infer_input_size,
-                             hidden_size=settings.SkillPrior.q_lstm_hidden_dim,
-                             output_size=settings.SkillPrior.q_embed_dim * 2, # 这里*2为了分别计算mu和sigma
-                             num_layers=settings.SkillPrior.q_lstm_layers
-                             )
-        # build decoder network
-        # self.decoder_input_initalizer = MultiLayerLinear(input_dim=settings.SkillPrior.prior_input_dim,
-        #                                                  hidden_dim=settings.SkillPrior.prior_hidden_dim,
-        #                                                  output_dim=self.action_dim,
-        #                                                  layers_num=settings.SkillPrior.prior_net_layers)
-        
-        # hidden_initalizer_dim = settings.SkillPrior.q_lstm_layers * settings.SkillPrior.q_lstm_hidden_dim
-        # self.decoder_hidden_initalizer = MultiLayerLinear(input_dim=settings.SkillPrior.prior_input_dim,
-        #                                                   hidden_dim=settings.SkillPrior.prior_hidden_dim,
-        #                                                   layers_num=settings.SkillPrior.prior_net_layers,
-        #                                                   output_dim=hidden_initalizer_dim)
+        self.q = self._build_inference_network()
+        self.decoder = self._build_reconstruction_network()
+        self.prior = self._build_prior_network()
+        self._build_beta_network()
 
-        self.decoder = LSTMDecoderWithInitalizer(input_size=self.state_dim + settings.SkillPrior.q_embed_dim,
-                                                 hidden_size=settings.SkillPrior.nz_mid_lstm,
-                                                 num_layers=settings.SkillPrior.q_lstm_layers,
-                                                 output_size=self.action_dim,)
-        # build prior network
-        # TODO: Change to MultiLayerLiner
-        # self.prior = MultiGussionDistri(ladent_dim=settings.SkillPrior.q_embed_dim,
-        #                                 input_dim=settings.SkillPrior.prior_input_dim,
-        #                                 hidden_dim=settings.SkillPrior.prior_hidden_dim,
-        #                                 output_dim=settings.SkillPrior.prior_hidden_dim,
-        #                                 layers_num=settings.SkillPrior.num_prior_net_layers)
-        self.prior = MultiLayerLinear(input_dim=settings.SkillPrior.prior_input_dim,
-                                      hidden_dim=settings.SkillPrior.prior_hidden_dim,
-                                      output_dim=settings.SkillPrior.q_embed_dim * 2,
-                                      layers_num=settings.SkillPrior.prior_net_layers)
-        
-        # optionally: optimize beta with dual gradient descent.
-        self.optimize_beta = settings.SkillPrior.optimize_beta
-        if self.optimize_beta:
-            self._log_beta = TensorModule(torch.zeros(1, requires_grad=True, device=self.device))
-            self._beta_opt = torch.optim.Adam(params=self._log_beta.parameters(), lr=3e-4, betas=(0.9, 0.999))
-            self._target_kl = settings.SkillPrior.target_kl
+    def _default_params(self, new_params):
+         # model params
+        self.model_params = AttrDict(
+            device = 'cuda',
+            action_dim = 2,
+            state_dim = 15,
+            z_size = 10,
+            skill_len = 9
+        )
+        # inference parameters
+        self.encoder_params = AttrDict(
+            cond_encode = True,
+            cond_encode_dim = self.model_params.state_dim,
+            lstm_hidden_dim_enc = 128,
+            lstm_layers_enc = 1
+        )
+        if 'encoder_params' in new_params.keys():
+            self.encoder_params.update(new_params.encoder_params)
+        # decoder paramters
+        self.decoder_params = AttrDict(
+            cond_decode = True,
+            cond_decode_dim = self.model_params.state_dim,
+            lstm_hidden_dim_dec = 128,
+            lstm_layers_dec = 1,
+            rec_mse_weight = 1.0,
+            n_rollout_steps = self.model_params.skill_len
+        )
+        if 'decoder_params' in new_params.keys():
+            self.decoder_params.update(new_params.decoder_params)
+        # prior_params
+        self.prior_params = AttrDict(
+            prior_input_size = self.model_params.state_dim,
+            hidden_dim_pr = 128,
+            num_layers = 6
+        )
+        if 'prior_params' in new_params.keys():
+            self.prior_params.update(new_params.prior_params)
+        # beta params
+        self.beta_params = AttrDict(
+            kl_div_weight = 0.0005,
+            target_kl = 0.18,
+            optimize_beta = False,
+            lr = 3e-4
+        )
+        if 'beta_params' in new_params.keys():
+            self.beta_params.update(new_params.beta_params)
+       
+        if 'model_params' in new_params.keys():
+            self.model_params.update(new_params.model_params)
     
+
+    def _build_inference_network(self):
+        self.cond_encode = self.encoder_params.cond_encode
+        self.cond_encode_dim = self.encoder_params.cond_encode_dim
+        self.infer_input_size = self.model_params.action_dim
+        if self.cond_encode:
+            self.infer_input_size += self.cond_encode_dim
+        return LSTMEncoder(
+            input_size = self.infer_input_size,
+            hidden_size = self.encoder_params.lstm_hidden_dim_enc,
+            output_size = self.model_params.z_size * 2,  # for compute mu and sigma individually.
+            num_layers = self.encoder_params.lstm_layers_enc
+        )
+    
+    def _build_reconstruction_network(self):
+        self.n_rollout_steps = self.decoder_params.n_rollout_steps
+        self.rec_mse_weight = self.decoder_params.rec_mse_weight
+        self.decoder_input_size = self.model_params.z_size
+        self.cond_decode = self.decoder_params.cond_decode
+        self.cond_decode_dim = self.decoder_params.cond_decode_dim
+        if self.cond_decode:
+            self.decoder_input_size += self.cond_decode_dim
+        return LSTMDecoder(
+            input_size=self.decoder_input_size,
+            hidden_size=self.decoder_params.lstm_hidden_dim_dec,
+            output_size=self.model_params.action_dim,
+            num_layers=self.decoder_params.lstm_layers_dec
+        )
+        
+    def _build_prior_network(self):
+        self.prior_input_size = self.prior_params.prior_input_size
+        return MultiLayerLinear(
+            input_dim= self.prior_input_size,
+            hidden_dim=self.prior_params.hidden_dim_pr,
+            output_dim=self.model_params.z_size * 2,
+            layers_num=self.prior_params.num_layers
+        )
+    
+    def _build_beta_network(self):
+        self.optimize_beta = self.beta_params.optimize_beta
+        if self.optimize_beta:
+            self._log_beta = TensorModule(torch.zeros(1, requires_grad=True, device=self.model_params.device))
+            self._beta_opt = torch.optim.Adam(params=self._log_beta.parameters(), lr=self.beta_params.lr, betas=(0.9, 0.99))
+            self._target_kl = self.beta_params.target_kl
+            assert self._target_kl is not None
+        else:
+            self.kl_div_weight = self.beta_params.kl_div_weight
+            assert self.kl_div_weight is not None
+
     def forward(self, inputs, use_learned_prior=False):
         """
         Args:
@@ -210,7 +286,7 @@ class SkillPriorMdl(torch.nn.Module):
 
         # decode
         output.reconstruction = self.decode(output.z, \
-            cond_inputs = self._learned_prior_input(inputs), \
+            cond_inputs = self._get_seq_dec(inputs), \
             steps = self.n_rollout_steps)
         
         return output
@@ -243,16 +319,48 @@ class SkillPriorMdl(torch.nn.Module):
         Args:
             inputs (AttriDict): AttriDict with states and actions.
         """
-        infer_inputs = torch.cat((inputs.actions, self._get_seq_enc(inputs)), dim=-1)
-        return MutivariateGuassion(self.q(infer_inputs))
+        return MutivariateGuassion(self.q(action=inputs.actions, cond_input=self._get_seq_enc(inputs)))
 
     def _get_seq_enc(self, inputs: AttrDict):
+        """Get condition inputs from inpput, overwrite it to use different condtion inputs.
+        Make sure the condition input dim is same to 'self.cond_encode_dim'. 
+        We use observation sequences as the condition encode inputs by default.
+
+        Args:
+            inputs (AttrDict): offline data with action, observations, rewards, etc.
+
+        Returns:
+            torch.Tensor/None: condition encode inputs.
+        """
+        if not self.cond_encode:
+            return None
         return inputs.states[:, :-1]
     
+    def _get_seq_dec(self, inputs:AttrDict):
+        """Get sequence decoder condition inputs. We use the first observation by default.
+
+        Args:
+            inputs (AttrDict): offline data with action, observations, rewards, etc.
+        """
+        if not self.cond_decode:
+            return None
+        return inputs.states[:, 0]
+    
     def _learned_prior_input(self, inputs):
+        """Get the prior network inputs, overwrite it to use different prior inputs.
+        By default, we the first observation of a const length sequence.
+
+        Args:
+            inputs (AttrDict): offine data with actions, obnservations, rewards, etc.
+
+        Returns:
+            Torch.Tensor: prior network inputs.
+        """
         return inputs.states[:, 0]
 
     def _compute_learned_prior(self, inputs):
+        """ Compute skill prior distribution.
+        """
         return MutivariateGuassion(self.prior(inputs))
 
     def _regression_targets(self, inputs):
@@ -347,3 +455,12 @@ class SkillPriorMdl(torch.nn.Module):
             return Gaussion(tensor.new_zeros(bs, dim, 1, 1), tensor.new_zeros(bs, dim, 1, 1))
         else:
             return Gaussion(torch.zeros_like(tensor.mu), torch.zeros_like(tensor.log_sigma))
+        
+    @property
+    def beta(self):
+        """Get beta. If self.optimize_beta = false, we use const beta = self.kl_div_weight
+
+        Returns:
+            _type_: _description_
+        """
+        return self._log_beta().exp()[0].detach() if self.optimize_beta else self.kl_div_weight
